@@ -1,0 +1,187 @@
+# Copyright (c) 2025, Oracle and/or its affiliates. All rights reserved.
+# Licensed under the Universal Permissive License v 1.0 as shown at https://oss.oracle.com/licenses/upl.
+
+title: "Process FOCUS Reports – OCI Function & Event Rule"
+description: "Deploys the process-focus-reports OCI Function and an Events rule that fires on staging bucket uploads."
+schemaVersion: 1.1.0
+version: "20250311"
+locale: "en"
+
+variableGroups:
+  - title: "General"
+    variables:
+      - compartment_ocid
+      - region
+
+  - title: "Networking"
+    variables:
+      - vcn_ocid
+      - subnet_ocid
+
+  - title: "Container Registry (OCIR)"
+    variables:
+      - ocir_username
+      - ocir_password
+      - repository_name
+
+  - title: "Functions Application"
+    variables:
+      - create_functions_application
+      - app_display_name
+      - existing_application_ocid
+      - function_display_name
+
+  - title: "Events Rule"
+    variables:
+      - event_rule_display_name
+      - staging_bucket_name
+      - event_rule_is_enabled
+
+  - title: "Advanced / Function Config"
+    variables:
+      - function_memory_in_mbs
+      - function_timeout_in_seconds
+      - function_parameters_json_string
+
+  - title: "Internal"
+    visible: false
+    variables:
+      - tenancy_ocid
+      - function_working_dir
+
+variables:
+
+  compartment_ocid:
+    type: oci:identity:compartment:id
+    title: "Compartment"
+    required: true
+
+  region:
+    type: oci:identity:region:name
+    title: "Region"
+    required: true
+    visible: false
+
+  vcn_ocid:
+    type: oci:core:vcn:id
+    title: "Virtual Cloud Network (VCN)"
+    required: true
+    dependsOn:
+      compartmentId: compartment_ocid
+
+  subnet_ocid:
+    type: oci:core:subnet:id
+    title: "Subnet"
+    required: true
+    dependsOn:
+      compartmentId: compartment_ocid
+      vcnId: vcn_ocid
+      vcnCompartmentId: compartment_ocid
+
+  ocir_username:
+    type: string
+    title: "OCIR Username"
+    description: "Format: oracleidentitycloudservice/<email>"
+    required: true
+
+  ocir_password:
+    type: password
+    title: "OCIR Auth Token"
+    description: "Generate under User Settings → Auth Tokens"
+    required: true
+
+  repository_name:
+    type: string
+    title: "OCIR Repository Name"
+    default: "focus-reports-repo"
+    required: true
+
+  create_functions_application:
+    type: boolean
+    title: "Create a new Functions Application"
+    description: "Uncheck to select an existing application"
+    default: true
+
+  app_display_name:
+    type: string
+    title: "New Application Name"
+    default: "focus-reports-app"
+    visible: create_functions_application
+    required: true
+
+  existing_application_ocid:
+    type: oci:functions:application:id
+    title: "Existing Functions Application"
+    description: "Select the Functions Application that will host the function"
+    dependsOn:
+      compartmentId: compartment_ocid
+    visible:
+      not:
+        - create_functions_application
+    required: true
+
+  function_display_name:
+    type: string
+    title: "Function Name"
+    default: "process-focus-reports"
+    required: true
+
+  event_rule_display_name:
+    type: string
+    title: "Event Rule Name"
+    default: "focus-report-staging-trigger"
+    required: true
+
+  staging_bucket_name:
+    type: string
+    title: "Staging Bucket Name"
+    description: "Object Storage bucket to watch for new .csv.gz uploads"
+    default: "Cost_Usage_Reports_Staging"
+    required: true
+
+  event_rule_is_enabled:
+    type: boolean
+    title: "Enable Event Rule on creation"
+    default: true
+
+  function_memory_in_mbs:
+    type: integer
+    title: "Function Memory (MB)"
+    minimum: 128
+    maximum: 2048
+    default: 2048
+
+  function_timeout_in_seconds:
+    type: integer
+    title: "Function Timeout (seconds)"
+    minimum: 30
+    maximum: 300
+    default: 300
+
+  function_parameters_json_string:
+    type: string
+    title: "Extra Function Config (JSON)"
+    description: 'Optional key-value pairs, e.g. {"TARGET_BUCKET":"Cost_Usage_Reports"}'
+    default: ""
+    required: false
+
+outputs:
+  function_ocid:
+    title: "Function OCID"
+    type: copyableString
+    visible: true
+
+  function_invoke_endpoint:
+    title: "Function Invoke Endpoint"
+    type: link
+    visible: true
+
+  event_rule_id:
+    title: "Event Rule OCID"
+    type: copyableString
+    visible: true
+
+  image_path:
+    title: "OCIR Image Path"
+    type: copyableString
+    visible: true

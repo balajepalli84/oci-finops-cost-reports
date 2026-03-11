@@ -1,0 +1,7 @@
+schema_version: 20180708
+name: process-focus-reports
+version: 0.0.9
+runtime: python3.11
+entrypoint: /python/bin/fdk /function/func.py handler
+memory: 2048
+timeout: 300
