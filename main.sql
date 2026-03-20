@@ -85,7 +85,7 @@ CREATE TABLE load_failures_log (
 CREATE OR REPLACE PROCEDURE load_oci_cost_files (
   p_days_back IN NUMBER
 ) AS
-  l_uri    VARCHAR2(1000) := 'https://objectstorage.us-ashburn-1.oraclecloud.com/n/bling/b/ocid1.tenancy.oc1..aaaaaaaaa3qmjxr43tjexx75r6gwk6vjw22ermohbw2vbxyhczksgjir7xdq/o/FOCUS%20Reports/';
+  l_uri    VARCHAR2(1000) := 'https://objectstorage.us-ashburn-1.oraclecloud.com/n/bling/b/ocid1.tenancy.oc1..xxxxxx/o/FOCUS%20Reports/';
   l_errmsg VARCHAR2(4000);
 BEGIN
   FOR r IN (
@@ -224,7 +224,7 @@ ORDER BY log_date DESC;
 SELECT COUNT(*) AS files_not_logged
 FROM DBMS_CLOUD.LIST_OBJECTS(
        'OCI$RESOURCE_PRINCIPAL',
-       'https://objectstorage.us-ashburn-1.oraclecloud.com/n/bling/b/ocid1.tenancy.oc1..aaaaaaaaa3qmjxr43tjexx75r6gwk6vjw22ermohbw2vbxyhczksgjir7xdq/o/FOCUS%20Reports/'
+       'https://objectstorage.us-ashburn-1.oraclecloud.com/n/bling/b/ocid1.tenancy.oc1..xxx/o/FOCUS%20Reports/'
      ) o
 WHERE o.object_name LIKE '%.csv.gz'
   AND NOT EXISTS (
