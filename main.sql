@@ -60,7 +60,7 @@ CREATE TABLE loaded_files_log (
 );
 
 DECLARE
-  l_uri VARCHAR2(1000) := 'https://objectstorage.us-phoenix-1.oraclecloud.com/n/<namespace>/b/<tenancy-ocid>/o/FOCUS%20Reports/';
+  l_uri VARCHAR2(1000) := 'https://objectstorage.us-region-name-1.oraclecloud.com/n/bling/b/<tenancy-ocid>/o/FOCUS%20Reports/';
 BEGIN
   FOR r IN (
     SELECT object_name 
@@ -96,7 +96,7 @@ END;
 /
 
 CREATE OR REPLACE PROCEDURE load_oci_cost_hourly AS
-  l_uri VARCHAR2(1000) := 'https://objectstorage.us-phoenix-1.oraclecloud.com/n/<namespace>/b/<tenancy-coid>/o/FOCUS%20Reports/';
+  l_uri VARCHAR2(1000) := 'https://objectstorage.us-region-name-1.oraclecloud.com/n/bling/b/<tenancy-coid>/o/FOCUS%20Reports/';
   l_count NUMBER;
 BEGIN
   FOR r IN (
