@@ -203,7 +203,7 @@ SELECT
     SELECT COUNT(*)
     FROM DBMS_CLOUD.LIST_OBJECTS(
            'OCI$RESOURCE_PRINCIPAL',
-           'https://objectstorage.us-phoenix-1.oraclecloud.com/n/<namespace>/b/<bucket>/o/FOCUS%20Reports/'
+           'https://objectstorage.us-region-name-1.oraclecloud.com/n/bling/b/<bucket>/o/FOCUS%20Reports/'
          )
     WHERE object_name LIKE '%.csv.gz'
   ) AS source_files,
@@ -211,7 +211,7 @@ SELECT
     SELECT COUNT(*)
     FROM DBMS_CLOUD.LIST_OBJECTS(
            'OCI$RESOURCE_PRINCIPAL',
-           'https://objectstorage.us-phoenix-1.oraclecloud.com/n/<namespace>/b/<bucket>/o/FOCUS%20Reports/'
+           'https://objectstorage.us-region-name-1.oraclecloud.com/n/bling/b/<bucket>/o/FOCUS%20Reports/'
          ) o
     WHERE o.object_name LIKE '%.csv.gz'
       AND NOT EXISTS (
