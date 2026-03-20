@@ -1,32 +1,32 @@
 # OCI FOCUS Cost Report Ingestion Pipeline
 
-Automated ingestion of Oracle Cloud Infrastructure (OCI) FOCUS Cost and Usage Reports into Autonomous Database (ADB) using `DBMS_CLOUD`, with scheduled hourly differential loading through `DBMS_SCHEDULER`.
+Automated ingestion of Oracle Cloud Infrastructure (OCI) FOCUS Cost and Usage Reports into Autonomous Database (ADB), with compartment hierarchy enrichment, scheduled incremental loading, and a materialized view optimized for Oracle Analytics Cloud (OAC).
 
 ---
 
 ## Architecture Overview
 
 ```text
-OCI Object Storage (FOCUS Reports bucket)
+OCI Object Storage (FOCUS Reports bucket — bling namespace)
         |
         |  DBMS_CLOUD.LIST_OBJECTS + COPY_DATA
         v
-Autonomous Database (ADB)
-        |-- OCI_COST_DATA_NEW     -> Main target table
-        |-- LOADED_FILES_LOG      -> File-level deduplication tracker
-        |-- LOAD_FAILURES_LOG     -> Failed file load tracking
+ADB — OCI_COST_DATA_NEW          (raw FOCUS cost data)
+ADB — LOADED_FILES_LOG           (file-level deduplication)
+ADB — LOAD_FAILURES_LOG          (failed file tracking)
         |
-        |-- LOAD_OCI_COST_HOURLY          -> Hourly differential loader
-        |-- RELOAD_OCI_COST_UNPROCESSED   -> Recovery loader for missed files
-````
-
-This solution supports:
-
-* initial historical backfill for the last 90 days
-* hourly differential loading for new files
-* file-level idempotency using `LOADED_FILES_LOG`
-* failure tracking using `LOAD_FAILURES_LOG`
-* a recovery path to reload files that were not processed earlier
+        |  LEFT JOIN on oci_CompartmentId
+        v
+ADB — ADB_OCI_COMPARTMENTS       (compartment hierarchy — name, path, level)
+ADB — ADB_OCI_COMPARTMENTS_LOG   (compartment refresh run log)
+        |
+        |  DBMS_MVIEW.REFRESH (complete, every 4 hours)
+        v
+ADB — OCI_DAILY_COST_MV          (daily aggregated cost view for OAC)
+        |
+        v
+Oracle Analytics Cloud (OAC)
+```
 
 ---
 
@@ -34,23 +34,27 @@ This solution supports:
 
 ### 1. Initial backfill
 
-A one-time PL/SQL block reads `.csv.gz` files from Object Storage for the last 90 days and loads them into `OCI_COST_DATA_NEW`.
+A one-time PL/SQL block reads `.csv.gz` FOCUS report files from Object Storage for the last 90 days and loads them into `OCI_COST_DATA_NEW`. Files already present in `LOADED_FILES_LOG` are skipped.
 
-### 2. Differential load
+### 2. Compartment hierarchy load
 
-A stored procedure named `LOAD_OCI_COST_HOURLY` runs every hour through `DBMS_SCHEDULER`. It checks for files modified in the last 24 hours that are not already logged in `LOADED_FILES_LOG`.
+A stored procedure `REFRESH_OCI_COMPARTMENTS` calls the OCI Identity API via `DBMS_CLOUD_OCI_ID_IDENTITY` to fetch all active compartments, upserts them into `ADB_OCI_COMPARTMENTS`, and computes `HIERARCHY_LEVEL` and `HIERARCHY_PATH` for each compartment using a recursive CTE. Stale entries are soft-deleted.
 
-### 3. Idempotency
+### 3. Materialized view
 
-A file is considered processed only after it is successfully loaded and inserted into `LOADED_FILES_LOG`. This prevents duplicate loads.
+`OCI_DAILY_COST_MV` aggregates `OCI_COST_DATA_NEW` by day, service, region, compartment, and charge type. It joins to `ADB_OCI_COMPARTMENTS` to enrich each row with the full compartment path. This view is the primary dataset for OAC dashboards.
 
-### 4. Failure handling
+### 4. Differential load
 
-If a file fails to load, the filename, error message, and timestamp are written to `LOAD_FAILURES_LOG`.
+`LOAD_OCI_COST_INCREMENTAL_1D` runs every hour via `DBMS_SCHEDULER`. It checks for files modified in the last 24 hours that are not yet in `LOADED_FILES_LOG`.
 
-### 5. Recovery / replay
+### 5. Idempotency
 
-A second procedure named `RELOAD_OCI_COST_UNPROCESSED` can be run as a background job to process any file in the bucket that is still missing from `LOADED_FILES_LOG`.
+A file is considered processed only after it is successfully loaded and inserted into `LOADED_FILES_LOG`. This prevents duplicate loads across runs.
+
+### 6. Failure handling
+
+If a file fails to load, the filename, error message, and timestamp are written to `LOAD_FAILURES_LOG`. Failed files remain visible for debugging and can be retried.
 
 ---
 
@@ -58,9 +62,7 @@ A second procedure named `RELOAD_OCI_COST_UNPROCESSED` can be run as a backgroun
 
 ### 1. OCI IAM Policy
 
-ADB uses `OCI$RESOURCE_PRINCIPAL` to access the OCI Usage Report bucket. That bucket is owned by the OCI usage-report tenancy. You must create a policy in your tenancy to allow this access.
-
-Example policy:
+ADB uses `OCI$RESOURCE_PRINCIPAL` to read from the OCI Usage Report bucket (owned by the OCI usage-report tenancy). Create a cross-tenancy policy in your tenancy:
 
 ```hcl
 define tenancy usage-report as ocid1.tenancy.oc1..aaaaaaaaned4fkpkisbwjlr56u7cj63lf3wffbilvqknstgtvzub7vhqkggq
@@ -69,7 +71,7 @@ endorse any-user to read objects in tenancy usage-report
   where request.resource.compartment.id = '<YOUR_ADB_COMPARTMENT_OCID>'
 ```
 
-You can tighten this further to a specific ADB instance:
+To scope it to a specific ADB instance:
 
 ```hcl
 endorse any-user to read objects in tenancy usage-report
@@ -78,15 +80,15 @@ endorse any-user to read objects in tenancy usage-report
 
 ### 2. ADB Resource Principal
 
-Resource Principal must be enabled on the Autonomous Database.
+Resource Principal must be enabled on the Autonomous Database instance.
 
-Check it:
+Verify:
 
 ```sql
 SELECT owner, credential_name
-FROM dba_credentials
-WHERE credential_name = 'OCI$RESOURCE_PRINCIPAL'
-  AND owner = 'ADMIN';
+FROM   dba_credentials
+WHERE  credential_name = 'OCI$RESOURCE_PRINCIPAL'
+  AND  owner = 'ADMIN';
 ```
 
 If no row is returned, enable it:
@@ -95,215 +97,201 @@ If no row is returned, enable it:
 EXEC DBMS_CLOUD_ADMIN.ENABLE_RESOURCE_PRINCIPAL();
 ```
 
-Re-run the query to confirm the credential exists before continuing.
-
 ---
 
 ## Database Objects
 
-### `OCI_COST_DATA_NEW`
+### Cost data
 
-Main target table that stores FOCUS cost data plus OCI-specific extension columns.
+| Object | Type | Purpose |
+|---|---|---|
+| `OCI_COST_DATA_NEW` | Table | Raw FOCUS cost rows loaded from Object Storage |
+| `LOADED_FILES_LOG` | Table | Tracks successfully loaded files (deduplication key) |
+| `LOAD_FAILURES_LOG` | Table | Records files that failed to load with error details |
+| `LOAD_OCI_COST_FILES` | Procedure | Core loader; accepts `p_days_back` parameter |
+| `LOAD_OCI_COST_BACKFILL_90D` | Procedure | Wrapper — calls loader with 90 days |
+| `LOAD_OCI_COST_INCREMENTAL_1D` | Procedure | Wrapper — calls loader with 1 day |
+| `JOB_LOAD_OCI_COSTS_HOURLY` | Scheduler Job | Runs `LOAD_OCI_COST_INCREMENTAL_1D` every hour |
 
-This includes:
+### Compartments
 
-* standard FOCUS fields such as `BilledCost`, `EffectiveCost`, `ServiceName`, `Region`, `ResourceId`, `Tags`
-* OCI extension fields such as `oci_CompartmentId`, `oci_CompartmentName`, `oci_AttributedCost`, `oci_ReferenceNumber`
+| Object | Type | Purpose |
+|---|---|---|
+| `ADB_OCI_COMPARTMENTS` | Table | Compartment metadata with hierarchy path and level |
+| `ADB_OCI_COMPARTMENTS_LOG` | Table | Run log for each compartment refresh execution |
+| `REFRESH_OCI_COMPARTMENTS` | Procedure | Fetches compartments from OCI Identity API and upserts |
+| `JOB_REFRESH_OCI_COMPARTMENTS` | Scheduler Job | Runs `REFRESH_OCI_COMPARTMENTS` every hour |
 
-### `LOADED_FILES_LOG`
+### Materialized view
 
-Tracks successfully processed files.
-
-| Column      | Type             | Purpose                               |
-| ----------- | ---------------- | ------------------------------------- |
-| `filename`  | `VARCHAR2(1000)` | Object name from the bucket           |
-| `load_date` | `TIMESTAMP`      | Time the file was successfully loaded |
-
-### `LOAD_FAILURES_LOG`
-
-Tracks failed file loads.
-
-| Column          | Type             | Purpose                           |
-| --------------- | ---------------- | --------------------------------- |
-| `filename`      | `VARCHAR2(1000)` | Object name that failed           |
-| `error_message` | `VARCHAR2(4000)` | Oracle error returned during load |
-| `error_time`    | `TIMESTAMP`      | Time of failure                   |
+| Object | Type | Purpose |
+|---|---|---|
+| `OCI_DAILY_COST_MV` | Materialized View | Daily cost aggregation enriched with compartment path; OAC source |
+| `JOB_REFRESH_OCI_DAILY_COST_MV` | Scheduler Job | Complete refresh of `OCI_DAILY_COST_MV` every 4 hours |
 
 ---
 
 ## Deployment Steps
 
-### Step 1. Create the tables
+Run the master SQL script in order. Each phase includes validation queries — review them before proceeding to the next phase.
 
-Run the SQL script to create:
+### Phase 1 — Cleanup
 
-* `OCI_COST_DATA_NEW`
-* `LOADED_FILES_LOG`
-* `LOAD_FAILURES_LOG`
+Drops all existing objects (jobs, MV, tables, procedures, `COPY$` tables). Safe to re-run. Verify all counts return `0` before proceeding.
 
-### Step 2. Run the initial backfill
+### Phase 2 — Compartments
 
-Run the backfill PL/SQL block once. This loads up to the last 90 days of `.csv.gz` files that are not already in `LOADED_FILES_LOG`.
+Creates `ADB_OCI_COMPARTMENTS` and `ADB_OCI_COMPARTMENTS_LOG`, deploys `REFRESH_OCI_COMPARTMENTS`, and runs it once.
 
-### Step 3. Create the hourly loader procedure
+**Must complete successfully before the MV can be created.** Validate that `total_compartments > 0` and `missing_path = 0`.
 
-Create `LOAD_OCI_COST_HOURLY`.
+### Phase 3 — Cost tables and procedures
 
-### Step 4. Create the hourly scheduler job
+Creates `OCI_COST_DATA_NEW`, `LOADED_FILES_LOG`, `LOAD_FAILURES_LOG`, and all three load procedures.
 
-Create `JOB_LOAD_OCI_COSTS_HOURLY` so new files are loaded every hour.
+### Phase 4 — 1-day test load
 
-### Step 5. Create the reload procedure
+Loads only the last 1 day of files. Validates row counts, date ranges, column parsing, and compartment join coverage. **Do not proceed to Phase 5 until this looks correct.**
 
-Create `RELOAD_OCI_COST_UNPROCESSED`.
+### Phase 5 — 90-day backfill
 
-### Step 6. Create the one-time reload job when needed
+Runs `LOAD_OCI_COST_BACKFILL_90D`. Files already loaded in Phase 4 are automatically skipped via `LOADED_FILES_LOG`. Validate date range spans ~90 days and failure count is acceptable.
 
-Use `JOB_RELOAD_OCI_COST_UNPROCESSED` only when you want to catch up on missed files.
+### Phase 6 — Materialized view
+
+Creates `OCI_DAILY_COST_MV`. **Requires both `ADB_OCI_COMPARTMENTS` and `OCI_COST_DATA_NEW` to be populated first.**
+
+Validate with the cross-check query — effective cost totals in the MV and raw table must match. Check `missing_path = 0` before connecting OAC.
+
+### Phase 7 — Schedule jobs
+
+Creates all three scheduler jobs. Only run after Phase 6 validation passes.
+
+| Job | Runs | Action |
+|---|---|---|
+| `JOB_LOAD_OCI_COSTS_HOURLY` | Every 1 hour | Incremental cost file load |
+| `JOB_REFRESH_OCI_COMPARTMENTS` | Every 1 hour | Compartment upsert and hierarchy rebuild |
+| `JOB_REFRESH_OCI_DAILY_COST_MV` | Every 4 hours | Complete MV refresh |
+
+### Phase 8 — Final sanity check
+
+Confirm all jobs are `ENABLED`, row counts are non-zero, and `FAILED_FILES` is at an acceptable level.
 
 ---
 
-## Monitoring and Operations
+## Key Validation Queries
 
-### Check hourly job history
+### MV vs raw table cost cross-check
 
 ```sql
-SELECT
-  log_date,
-  status,
-  error#,
-  run_duration,
-  additional_info
-FROM user_scheduler_job_run_details
-WHERE job_name = 'JOB_LOAD_OCI_COSTS_HOURLY'
-ORDER BY log_date DESC;
+SELECT 'RAW_TABLE' AS source, ROUND(SUM(EffectiveCost),       2) AS total_effective_cost FROM oci_cost_data_new
+UNION ALL
+SELECT 'MV'        AS source, ROUND(SUM(DAILY_EFFECTIVECOST), 2) AS total_effective_cost FROM ADMIN.OCI_DAILY_COST_MV;
 ```
 
-### Check reload job history
+### Compartment join coverage (should be 0 or near 0)
 
 ```sql
-SELECT
-  log_date,
-  status,
-  error#,
-  run_duration,
-  additional_info
-FROM user_scheduler_job_run_details
-WHERE job_name = 'JOB_RELOAD_OCI_COST_UNPROCESSED'
-ORDER BY log_date DESC;
+SELECT COUNT(*) AS cost_rows_with_no_compartment_match
+FROM   oci_cost_data_new c
+WHERE  NOT EXISTS (
+         SELECT 1 FROM adb_oci_compartments cp
+         WHERE  cp.compartment_ocid = c.oci_CompartmentId
+       )
+  AND  c.oci_CompartmentId IS NOT NULL;
 ```
 
-### Check reconciliation between source, loaded files, and target rows
+### MV freshness
 
 ```sql
-SELECT
-  (SELECT COUNT(*) FROM OCI_COST_DATA_NEW) AS target_rows,
-  (SELECT COUNT(*) FROM loaded_files_log) AS logged_files,
-  (
-    SELECT COUNT(*)
-    FROM DBMS_CLOUD.LIST_OBJECTS(
-           'OCI$RESOURCE_PRINCIPAL',
-           'https://objectstorage.us-region-name-1.oraclecloud.com/n/bling/b/<bucket>/o/FOCUS%20Reports/'
-         )
-    WHERE object_name LIKE '%.csv.gz'
-  ) AS source_files,
-  (
-    SELECT COUNT(*)
-    FROM DBMS_CLOUD.LIST_OBJECTS(
-           'OCI$RESOURCE_PRINCIPAL',
-           'https://objectstorage.us-region-name-1.oraclecloud.com/n/bling/b/<bucket>/o/FOCUS%20Reports/'
-         ) o
-    WHERE o.object_name LIKE '%.csv.gz'
-      AND NOT EXISTS (
-        SELECT 1
-        FROM loaded_files_log f
-        WHERE f.filename = o.object_name
-      )
-  ) AS files_not_logged
-FROM dual;
+SELECT mview_name, last_refresh_date, staleness, compile_state
+FROM   user_mviews
+WHERE  mview_name = 'OCI_DAILY_COST_MV';
 ```
 
-### Check failed loads
+### Scheduler job health
 
 ```sql
-SELECT *
-FROM load_failures_log
-ORDER BY error_time DESC;
+SELECT job_name, enabled, state, last_start_date, last_run_duration
+FROM   user_scheduler_jobs
+WHERE  job_name IN (
+         'JOB_LOAD_OCI_COSTS_HOURLY',
+         'JOB_REFRESH_OCI_COMPARTMENTS',
+         'JOB_REFRESH_OCI_DAILY_COST_MV'
+       );
 ```
 
-### Check files loaded by day
+### Job run history
 
 ```sql
-SELECT
-  TRUNC(load_date) AS load_day,
-  COUNT(*) AS files_loaded
-FROM loaded_files_log
-GROUP BY TRUNC(load_date)
-ORDER BY load_day DESC;
+SELECT log_date, job_name, status, error#, run_duration, additional_info
+FROM   user_scheduler_job_run_details
+WHERE  job_name IN (
+         'JOB_LOAD_OCI_COSTS_HOURLY',
+         'JOB_REFRESH_OCI_COMPARTMENTS',
+         'JOB_REFRESH_OCI_DAILY_COST_MV'
+       )
+ORDER  BY log_date DESC
+FETCH  FIRST 30 ROWS ONLY;
 ```
 
-### Check latest loaded file entries
+### Files not yet loaded
 
 ```sql
-SELECT *
-FROM loaded_files_log
-ORDER BY load_date DESC
-FETCH FIRST 50 ROWS ONLY;
+SELECT COUNT(*) AS files_not_yet_loaded
+FROM   DBMS_CLOUD.LIST_OBJECTS(
+         'OCI$RESOURCE_PRINCIPAL',
+         'https://objectstorage.us-ashburn-1.oraclecloud.com/n/bling/b/<YOUR_TENANCY_OCID>/o/FOCUS%20Reports/'
+       ) o
+WHERE  o.object_name LIKE '%.csv.gz'
+  AND  NOT EXISTS (SELECT 1 FROM loaded_files_log f WHERE f.filename = o.object_name);
 ```
 
-### Check latest data present in target table
+### Failed loads
 
 ```sql
-SELECT
-  MAX(BillingPeriodStart) AS max_billing_period_start,
-  MAX(BillingPeriodEnd)   AS max_billing_period_end,
-  COUNT(*)                AS total_rows
-FROM OCI_COST_DATA_NEW;
+SELECT filename, error_message, error_time
+FROM   load_failures_log
+ORDER  BY error_time DESC;
+```
+
+### Compartment refresh log
+
+```sql
+SELECT status, rows_loaded, run_start_ts, run_end_ts, error_message
+FROM   adb_oci_compartments_log
+ORDER  BY run_id DESC
+FETCH  FIRST 10 ROWS ONLY;
 ```
 
 ---
 
 ## Job Control
 
-### Stop jobs
+### Stop a running job
 
 ```sql
-BEGIN
-  DBMS_SCHEDULER.STOP_JOB('JOB_LOAD_OCI_COSTS_HOURLY', TRUE);
-END;
+BEGIN DBMS_SCHEDULER.STOP_JOB('JOB_LOAD_OCI_COSTS_HOURLY', TRUE); END;
 /
-
-BEGIN
-  DBMS_SCHEDULER.STOP_JOB('JOB_RELOAD_OCI_COST_UNPROCESSED', TRUE);
-END;
+BEGIN DBMS_SCHEDULER.STOP_JOB('JOB_REFRESH_OCI_COMPARTMENTS', TRUE); END;
+/
+BEGIN DBMS_SCHEDULER.STOP_JOB('JOB_REFRESH_OCI_DAILY_COST_MV', TRUE); END;
 /
 ```
 
-### Disable and enable hourly job
+### Disable / enable hourly cost job
 
 ```sql
-BEGIN
-  DBMS_SCHEDULER.DISABLE('JOB_LOAD_OCI_COSTS_HOURLY');
-END;
+BEGIN DBMS_SCHEDULER.DISABLE('JOB_LOAD_OCI_COSTS_HOURLY'); END;
 /
-
-BEGIN
-  DBMS_SCHEDULER.ENABLE('JOB_LOAD_OCI_COSTS_HOURLY');
-END;
+BEGIN DBMS_SCHEDULER.ENABLE('JOB_LOAD_OCI_COSTS_HOURLY'); END;
 /
 ```
 
-### Drop jobs
+### Manually trigger MV refresh
 
 ```sql
-BEGIN
-  DBMS_SCHEDULER.DROP_JOB('JOB_RELOAD_OCI_COST_UNPROCESSED', TRUE);
-END;
-/
-
-BEGIN
-  DBMS_SCHEDULER.DROP_JOB('JOB_LOAD_OCI_COSTS_HOURLY', TRUE);
-END;
+BEGIN DBMS_MVIEW.REFRESH('ADMIN.OCI_DAILY_COST_MV', 'C'); END;
 /
 ```
 
@@ -311,36 +299,42 @@ END;
 
 ## File Format Used by `DBMS_CLOUD.COPY_DATA`
 
-| Property               | Value                        |
-| ---------------------- | ---------------------------- |
-| Source format          | CSV                          |
-| Compression            | GZIP                         |
-| Skip headers           | 1                            |
-| Timestamp format       | `YYYY-MM-DD"T"HH24:MI:SS"Z"` |
-| Ignore missing columns | true                         |
-| Trim spaces            | `lrtrim`                     |
-| Blank as null          | true                         |
+| Property | Value |
+|---|---|
+| Source format | CSV |
+| Compression | GZIP |
+| Delimiter | `,` |
+| Skip headers | 1 |
+| Quote character | `"` |
+| Timestamp format | `YYYY-MM-DD"T"HH24:MI:SS.FF3"Z"` |
+| Ignore missing columns | true |
+| Trim spaces | `lrtrim` |
+| Blank as null | true |
+| Conversion errors | `store_null` |
+| Reject limit | 100000 |
 
 ---
 
 ## Important Notes
 
-* `LOADED_FILES_LOG` is the control table for idempotency. Do not truncate it unless you want to reload files again.
-* `LOAD_FAILURES_LOG` keeps failed files visible so you can debug bad files or permission issues.
-* The hourly loader checks the last 24 hours of object updates. This is intentional so files near day boundaries are not missed.
-* The recovery procedure does not depend on `last_modified >= SYSDATE - 1`. It checks the whole bucket and loads any file not yet logged.
-* If a file load succeeds but logging fails, that file can be retried later. This is why the filename primary key is important.
-* Update the Object Storage URI in the script to match your namespace and bucket.
-* Run the backfill only once. After that, let the hourly job handle normal ingestion.
+- `LOADED_FILES_LOG` is the idempotency control table. Do not truncate it unless you intend to reload all files from scratch.
+- `ADB_OCI_COMPARTMENTS` must be populated before `OCI_DAILY_COST_MV` is created. The MV DDL references this table directly.
+- The MV uses `REFRESH COMPLETE ON DEMAND`. It does not support fast (incremental) refresh due to the aggregation and outer join.
+- The hourly cost loader checks the last 24 hours of object modifications. This intentionally overlaps day boundaries to avoid missing files.
+- `SQLERRM` cannot be used directly inside a SQL `UPDATE` statement in Oracle — it must be captured into a PL/SQL variable first before being passed to a DML statement.
+- Update the Object Storage URI in the script to match your namespace and tenancy OCID before deploying.
+- Run the 90-day backfill only once. After that, the hourly job handles normal ingestion.
+- A 1-day test load (Phase 4) is strongly recommended before running the full 90-day backfill to validate column alignment and compartment join coverage early.
 
 ---
 
 ## Recommended Run Order
 
-1. create tables
-2. run initial backfill
-3. create hourly load procedure
-4. create hourly scheduler job
-5. monitor hourly job
-6. use reload procedure only when files were missed or failures occurred
-
+1. Run cleanup (Phase 1) — confirm all counts are 0
+2. Create compartments and run once (Phase 2) — confirm rows loaded, hierarchy built
+3. Create cost tables and procedures (Phase 3)
+4. Run 1-day test load and validate (Phase 4) — confirm data looks correct
+5. Run 90-day backfill (Phase 5) — confirm date range and row counts
+6. Create and validate materialized view (Phase 6) — confirm cost totals match raw table
+7. Schedule all three jobs (Phase 7)
+8. Run final sanity check (Phase 8)
