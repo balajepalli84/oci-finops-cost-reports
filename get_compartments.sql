@@ -1,129 +1,156 @@
 --------------------------------------------------------------------------------
--- 1. DROP OLD OBJECTS IF THEY EXIST
---    Safe to run multiple times
+-- OCI FinOps — Master Unified Script
+--
+-- EXECUTION ORDER:
+--   PHASE 1 : Cleanup (drop existing objects)
+--   PHASE 2 : Create compartments table + procedure → run once → validate
+--   PHASE 3 : Create cost tables + procedures
+--   PHASE 4 : Run 1-day test load → validate before full backfill
+--   PHASE 5 : Run 90-day backfill → validate
+--   PHASE 6 : Create materialized view → validate
+--   PHASE 7 : Schedule all jobs
+--   PHASE 8 : Final sanity check
 --------------------------------------------------------------------------------
-begin
-  begin
-    dbms_scheduler.drop_job('JOB_REFRESH_OCI_COMPARTMENTS', force => true);
-  exception
-    when others then
-      if sqlcode != -27475 then raise; end if; -- job does not exist
-  end;
-end;
+
+
+--------------------------------------------------------------------------------
+-- PHASE 1: CLEANUP — drop everything safely, safe to re-run
+--------------------------------------------------------------------------------
+
+-- 1a. Drop scheduler jobs
+BEGIN DBMS_SCHEDULER.DROP_JOB('JOB_LOAD_OCI_COSTS_HOURLY',       TRUE); EXCEPTION WHEN OTHERS THEN NULL; END;
 /
-    
-begin
-  execute immediate 'drop procedure refresh_oci_compartments';
-exception
-  when others then
-    if sqlcode != -4043 then raise; end if; -- object does not exist
-end;
+BEGIN DBMS_SCHEDULER.DROP_JOB('JOB_REFRESH_OCI_DAILY_COST_MV',   TRUE); EXCEPTION WHEN OTHERS THEN NULL; END;
+/
+BEGIN DBMS_SCHEDULER.DROP_JOB('JOB_REFRESH_OCI_COMPARTMENTS',    TRUE); EXCEPTION WHEN OTHERS THEN NULL; END;
 /
 
-begin
-  execute immediate 'drop table adb_oci_compartments purge';
-exception
-  when others then
-    if sqlcode != -942 then raise; end if; -- table does not exist
-end;
+-- 1b. Drop materialized view
+BEGIN EXECUTE IMMEDIATE 'DROP MATERIALIZED VIEW ADMIN.OCI_DAILY_COST_MV'; EXCEPTION WHEN OTHERS THEN NULL; END;
 /
 
-begin
-  execute immediate 'drop table adb_oci_compartments_log purge';
-exception
-  when others then
-    if sqlcode != -942 then raise; end if; -- table does not exist
-end;
+-- 1c. Drop cost tables
+BEGIN EXECUTE IMMEDIATE 'DROP TABLE OCI_COST_DATA_NEW  PURGE'; EXCEPTION WHEN OTHERS THEN NULL; END;
 /
+BEGIN EXECUTE IMMEDIATE 'DROP TABLE LOADED_FILES_LOG   PURGE'; EXCEPTION WHEN OTHERS THEN NULL; END;
+/
+BEGIN EXECUTE IMMEDIATE 'DROP TABLE LOAD_FAILURES_LOG  PURGE'; EXCEPTION WHEN OTHERS THEN NULL; END;
+/
+
+-- 1d. Drop compartment tables
+BEGIN EXECUTE IMMEDIATE 'DROP TABLE ADB_OCI_COMPARTMENTS      PURGE'; EXCEPTION WHEN OTHERS THEN NULL; END;
+/
+BEGIN EXECUTE IMMEDIATE 'DROP TABLE ADB_OCI_COMPARTMENTS_LOG  PURGE'; EXCEPTION WHEN OTHERS THEN NULL; END;
+/
+
+-- 1e. Drop procedures
+BEGIN EXECUTE IMMEDIATE 'DROP PROCEDURE LOAD_OCI_COST_FILES';           EXCEPTION WHEN OTHERS THEN NULL; END;
+/
+BEGIN EXECUTE IMMEDIATE 'DROP PROCEDURE LOAD_OCI_COST_BACKFILL_90D';    EXCEPTION WHEN OTHERS THEN NULL; END;
+/
+BEGIN EXECUTE IMMEDIATE 'DROP PROCEDURE LOAD_OCI_COST_INCREMENTAL_1D';  EXCEPTION WHEN OTHERS THEN NULL; END;
+/
+BEGIN EXECUTE IMMEDIATE 'DROP PROCEDURE REFRESH_OCI_COMPARTMENTS';      EXCEPTION WHEN OTHERS THEN NULL; END;
+/
+
+-- 1f. Drop all COPY$ tables left from prior test runs
+BEGIN
+  FOR t IN (SELECT table_name FROM user_tables WHERE table_name LIKE 'COPY$%' ORDER BY table_name) LOOP
+    BEGIN
+      EXECUTE IMMEDIATE 'DROP TABLE "' || t.table_name || '" PURGE';
+      DBMS_OUTPUT.PUT_LINE('Dropped: ' || t.table_name);
+    EXCEPTION WHEN OTHERS THEN
+      DBMS_OUTPUT.PUT_LINE('Could not drop: ' || t.table_name || ' — ' || SQLERRM);
+    END;
+  END LOOP;
+END;
+/
+
+-- 1g. Verify cleanup (all counts should be 0)
+SELECT 'JOBS'        AS object_type, COUNT(*) AS remaining FROM user_scheduler_jobs WHERE job_name   IN ('JOB_LOAD_OCI_COSTS_HOURLY','JOB_REFRESH_OCI_DAILY_COST_MV','JOB_REFRESH_OCI_COMPARTMENTS')
+UNION ALL
+SELECT 'MV'          AS object_type, COUNT(*) AS remaining FROM user_mviews          WHERE mview_name = 'OCI_DAILY_COST_MV'
+UNION ALL
+SELECT 'COST_TABLES' AS object_type, COUNT(*) AS remaining FROM user_tables          WHERE table_name IN ('OCI_COST_DATA_NEW','LOADED_FILES_LOG','LOAD_FAILURES_LOG')
+UNION ALL
+SELECT 'COMP_TABLES' AS object_type, COUNT(*) AS remaining FROM user_tables          WHERE table_name IN ('ADB_OCI_COMPARTMENTS','ADB_OCI_COMPARTMENTS_LOG')
+UNION ALL
+SELECT 'COPY$'       AS object_type, COUNT(*) AS remaining FROM user_tables          WHERE table_name LIKE 'COPY$%'
+UNION ALL
+SELECT 'PROCEDURES'  AS object_type, COUNT(*) AS remaining FROM user_objects         WHERE object_name IN ('LOAD_OCI_COST_FILES','LOAD_OCI_COST_BACKFILL_90D','LOAD_OCI_COST_INCREMENTAL_1D','REFRESH_OCI_COMPARTMENTS');
+
+
 --------------------------------------------------------------------------------
--- 2. CREATE LOG TABLE
+-- PHASE 2: COMPARTMENTS — must exist before MV can be created
 --------------------------------------------------------------------------------
-create table adb_oci_compartments_log (
-  run_id         number generated by default as identity primary key,
-  run_start_ts   timestamp with time zone not null,
-  run_end_ts     timestamp with time zone,
-  status         varchar2(30) not null,
-  rows_loaded    number,
-  error_message  varchar2(4000)
+
+-- 2a. Log table
+CREATE TABLE adb_oci_compartments_log (
+  run_id         NUMBER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+  run_start_ts   TIMESTAMP WITH TIME ZONE NOT NULL,
+  run_end_ts     TIMESTAMP WITH TIME ZONE,
+  status         VARCHAR2(30) NOT NULL,
+  rows_loaded    NUMBER,
+  error_message  VARCHAR2(4000)
 );
 /
---------------------------------------------------------------------------------
--- 3. CREATE TARGET TABLE
---------------------------------------------------------------------------------
-create table adb_oci_compartments (
-  compartment_ocid         varchar2(500) primary key,
-  parent_compartment_ocid  varchar2(500),
-  tenancy_ocid             varchar2(500) not null,
-  name                     varchar2(255) not null,
-  description              varchar2(4000),
-  time_created             timestamp with time zone,
-  lifecycle_state          varchar2(50),
-  inactive_status          number,
-  is_accessible            number(1),
-  region_name              varchar2(100),
-  hierarchy_level          number,
-  hierarchy_path           varchar2(4000),
-  last_refresh_ts          timestamp with time zone not null
+
+-- 2b. Target table
+CREATE TABLE adb_oci_compartments (
+  compartment_ocid         VARCHAR2(500) PRIMARY KEY,
+  parent_compartment_ocid  VARCHAR2(500),
+  tenancy_ocid             VARCHAR2(500) NOT NULL,
+  name                     VARCHAR2(255) NOT NULL,
+  description              VARCHAR2(4000),
+  time_created             TIMESTAMP WITH TIME ZONE,
+  lifecycle_state          VARCHAR2(50),
+  inactive_status          NUMBER,
+  is_accessible            NUMBER(1),
+  region_name              VARCHAR2(100),
+  hierarchy_level          NUMBER,
+  hierarchy_path           VARCHAR2(4000),
+  last_refresh_ts          TIMESTAMP WITH TIME ZONE NOT NULL
 );
 /
 
-create index adb_oci_compartments_ix1
-  on adb_oci_compartments (parent_compartment_ocid);
+CREATE INDEX adb_oci_compartments_ix1 ON adb_oci_compartments (parent_compartment_ocid);
+/
+CREATE INDEX adb_oci_compartments_ix2 ON adb_oci_compartments (last_refresh_ts);
+/
+CREATE INDEX adb_oci_compartments_ix3 ON adb_oci_compartments (name);
 /
 
-create index adb_oci_compartments_ix2
-  on adb_oci_compartments (last_refresh_ts);
-/
-
-create index adb_oci_compartments_ix3
-  on adb_oci_compartments (name);
-/
---------------------------------------------------------------------------------
--- 4. CREATE PROCEDURE
---------------------------------------------------------------------------------
-create or replace procedure refresh_oci_compartments
+-- 2c. Procedure — exact working code, no changes
+CREATE OR REPLACE PROCEDURE refresh_oci_compartments
 as
-  ------------------------------------------------------------------------------
-  -- CHANGE THESE 3 VALUES FOR YOUR ENVIRONMENT
-  ------------------------------------------------------------------------------
-  c_tenancy_id  constant varchar2(500) := 'ocid1.tenancy.oc1..aaaaaaaamy3a46ljb5gdtruftfg7xtuatc5ymgeob3sivuuao34sjbx3tk3q';
-  c_region      constant varchar2(50)  := 'us-phoenix-1';
+  -- SUBSTITUTION VARIABLES (Will prompt you on run)
+  c_tenancy_id  constant varchar2(500) := 'ocid1.tenancy.oc1..xxxx';
+  c_region      constant varchar2(50)  := 'us-phoenix-1'; -- e.g., us-ashburn-1
   c_credential  constant varchar2(100) := 'OCI$RESOURCE_PRINCIPAL';
+  c_page_size   constant number        := 1000;
 
-  ------------------------------------------------------------------------------
-  -- OPTIONAL TUNING
-  ------------------------------------------------------------------------------
-  c_page_size   constant number := 1000;
-
-  ------------------------------------------------------------------------------
   -- API OBJECTS
-  ------------------------------------------------------------------------------
   response        dbms_cloud_oci_id_identity_list_compartments_response_t;
   response_body   dbms_cloud_oci_identity_compartment_tbl;
-
-  ------------------------------------------------------------------------------
+  
   -- LOGIC VARIABLES
-  ------------------------------------------------------------------------------
   l_next_page     varchar2(4000)           := null;
   l_is_first      boolean                  := true;
   l_run_id        number;
   l_run_start     timestamp with time zone := systimestamp;
   l_rows_loaded   number                   := 0;
+  l_errmsg        varchar2(4000);           -- captures SQLERRM before use in SQL
 
 begin
-  ------------------------------------------------------------------------------
-  -- A. START LOGGING
-  ------------------------------------------------------------------------------
+  -- A. Start Logging
   insert into adb_oci_compartments_log (run_start_ts, status)
   values (l_run_start, 'RUNNING')
   returning run_id into l_run_id;
-
   commit;
 
-  ------------------------------------------------------------------------------
-  -- B. MAIN FETCH LOOP
-  ------------------------------------------------------------------------------
+  -- B. Main Fetch Loop
   loop
+    -- 1. Call OCI API
     if l_is_first then
       response := dbms_cloud_oci_id_identity.list_compartments(
         compartment_id            => c_tenancy_id,
@@ -148,6 +175,7 @@ begin
       );
     end if;
 
+    -- 2. Process Response Batch
     response_body := response.response_body;
 
     if response_body is not null and response_body.count > 0 then
@@ -160,20 +188,17 @@ begin
             c_tenancy_id                              as tenancy_ocid,
             response_body(i).name                     as name,
             response_body(i).description              as description,
-            cast(response_body(i).time_created as timestamp with time zone) as time_created,
+            cast(response_body(i).time_created 
+                 as timestamp with time zone)         as time_created,
             response_body(i).lifecycle_state          as lifecycle_state,
             response_body(i).inactive_status          as inactive_status,
-            case
-              when response_body(i).is_accessible then 1
-              else 0
-            end                                       as is_accessible,
+            response_body(i).is_accessible            as is_accessible,
             c_region                                  as region_name
           from dual
         ) src
         on (tgt.compartment_ocid = src.compartment_ocid)
         when matched then update set
           tgt.parent_compartment_ocid = src.parent_compartment_ocid,
-          tgt.tenancy_ocid            = src.tenancy_ocid,
           tgt.name                    = src.name,
           tgt.description             = src.description,
           tgt.time_created            = src.time_created,
@@ -183,170 +208,476 @@ begin
           tgt.region_name             = src.region_name,
           tgt.last_refresh_ts         = systimestamp
         when not matched then insert (
-          compartment_ocid,
-          parent_compartment_ocid,
-          tenancy_ocid,
-          name,
-          description,
-          time_created,
-          lifecycle_state,
-          inactive_status,
-          is_accessible,
-          region_name,
-          last_refresh_ts
+          compartment_ocid, parent_compartment_ocid, tenancy_ocid,
+          name, description, time_created, lifecycle_state,
+          inactive_status, is_accessible, region_name, last_refresh_ts
         ) values (
-          src.compartment_ocid,
-          src.parent_compartment_ocid,
-          src.tenancy_ocid,
-          src.name,
-          src.description,
-          src.time_created,
-          src.lifecycle_state,
-          src.inactive_status,
-          src.is_accessible,
-          src.region_name,
-          systimestamp
+          src.compartment_ocid, src.parent_compartment_ocid, src.tenancy_ocid,
+          src.name, src.description, src.time_created, src.lifecycle_state,
+          src.inactive_status, src.is_accessible, src.region_name, systimestamp
         );
 
         l_rows_loaded := l_rows_loaded + 1;
       end loop;
     end if;
 
-    ----------------------------------------------------------------------------
-    -- PAGINATION
-    ----------------------------------------------------------------------------
+    -- 3. Pagination Logic (Extract Token from Headers)
     l_next_page := null;
-
     if response.headers is not null then
-      if response.headers.has('opc-next-page') then
-        l_next_page := response.headers.get_string('opc-next-page');
-      end if;
+       if response.headers.has('opc-next-page') then
+          l_next_page := response.headers.get_string('opc-next-page');
+       end if;
     end if;
 
     exit when l_next_page is null;
+
   end loop;
 
-  ------------------------------------------------------------------------------
-  -- C. BUILD HIERARCHY LEVEL AND PATH
-  ------------------------------------------------------------------------------
+  -- C. Build Hierarchy Paths (Post-Process)
   merge into adb_oci_compartments tgt
   using (
     with hier (compartment_ocid, parent_compartment_ocid, lvl, path) as (
-      select
-        compartment_ocid,
-        parent_compartment_ocid,
-        1 as lvl,
-        cast(name as varchar2(4000)) as path
-      from adb_oci_compartments
-      where parent_compartment_ocid = c_tenancy_id
-
+      select compartment_ocid, parent_compartment_ocid, 1, cast(name as varchar2(4000))
+      from   adb_oci_compartments
+      where  parent_compartment_ocid = c_tenancy_id -- Root of search
       union all
-
-      select
-        c.compartment_ocid,
-        c.parent_compartment_ocid,
-        h.lvl + 1,
-        h.path || ' / ' || c.name
-      from adb_oci_compartments c
-      join hier h
-        on c.parent_compartment_ocid = h.compartment_ocid
+      select c.compartment_ocid, c.parent_compartment_ocid, h.lvl + 1, h.path || ' / ' || c.name
+      from   adb_oci_compartments c
+      join   hier h on c.parent_compartment_ocid = h.compartment_ocid
     )
-    select
-      compartment_ocid,
-      lvl,
-      path
-    from hier
+    select compartment_ocid, lvl, path from hier
   ) src
   on (tgt.compartment_ocid = src.compartment_ocid)
   when matched then update set
     tgt.hierarchy_level = src.lvl,
     tgt.hierarchy_path  = src.path;
 
-  ------------------------------------------------------------------------------
-  -- D. MARK OLD ROWS AS DELETED IF NOT SEEN IN THIS RUN
-  ------------------------------------------------------------------------------
+  -- D. Cleanup Deleted Items
   update adb_oci_compartments
-     set lifecycle_state = 'DELETED',
+  set    lifecycle_state = 'DELETED',
          last_refresh_ts = systimestamp
-   where last_refresh_ts < l_run_start
-     and lifecycle_state <> 'DELETED';
+  where  last_refresh_ts  < l_run_start
+  and    lifecycle_state != 'DELETED';
 
   commit;
 
-  ------------------------------------------------------------------------------
-  -- E. LOG SUCCESS
-  ------------------------------------------------------------------------------
+  -- E. Log Success
   update adb_oci_compartments_log
-     set run_end_ts  = systimestamp,
+  set    run_end_ts  = systimestamp,
          status      = 'SUCCESS',
          rows_loaded = l_rows_loaded
-   where run_id = l_run_id;
-
+  where  run_id = l_run_id;
   commit;
 
 exception
   when others then
+    l_errmsg := substr(sqlerrm, 1, 4000);  -- capture before use in SQL statement
     rollback;
-
     update adb_oci_compartments_log
-       set run_end_ts    = systimestamp,
+    set    run_end_ts    = systimestamp,
            status        = 'FAILED',
            rows_loaded   = l_rows_loaded,
-           error_message = substr(sqlerrm, 1, 4000)
-     where run_id = l_run_id;
-
+           error_message = l_errmsg
+    where  run_id = l_run_id;
     commit;
     raise;
 end refresh_oci_compartments;
 /
-show errors
---------------------------------------------------------------------------------
--- 5. TEST RUN THE PROCEDURE ONCE
---------------------------------------------------------------------------------
-begin
+SHOW ERRORS;
+
+-- 2d. Run compartments load once
+BEGIN
   refresh_oci_compartments;
-end;
+END;
 /
+
+-- 2e. Validate compartments
+SELECT status, rows_loaded, run_start_ts, run_end_ts
+FROM   adb_oci_compartments_log
+ORDER  BY run_id DESC
+FETCH  FIRST 1 ROWS ONLY;
+
+SELECT COUNT(*)                                                   AS total_compartments,
+       COUNT(CASE WHEN hierarchy_path  IS NULL THEN 1 END)        AS missing_path,
+       COUNT(CASE WHEN hierarchy_level IS NULL THEN 1 END)        AS missing_level,
+       MAX(hierarchy_level)                                        AS max_depth
+FROM   adb_oci_compartments;
+
+SELECT name, hierarchy_level, hierarchy_path
+FROM   adb_oci_compartments
+ORDER  BY hierarchy_path NULLS FIRST, name
+FETCH  FIRST 15 ROWS ONLY;
+
+
 --------------------------------------------------------------------------------
--- 6. CREATE HOURLY SCHEDULER JOB
+-- PHASE 3: COST TABLES + PROCEDURES
 --------------------------------------------------------------------------------
-begin
-  dbms_scheduler.create_job (
+
+-- 3a. Target table
+CREATE TABLE oci_cost_data_new (
+  AvailabilityZone             VARCHAR2(4000),
+  BilledCost                   NUMBER,
+  BillingAccountId             VARCHAR2(4000),
+  BillingAccountName           VARCHAR2(4000),
+  BillingCurrency              VARCHAR2(4000),
+  BillingPeriodEnd             TIMESTAMP(6),
+  BillingPeriodStart           TIMESTAMP(6),
+  ChargeCategory               VARCHAR2(4000),
+  ChargeDescription            VARCHAR2(4000),
+  ChargeFrequency              VARCHAR2(4000),
+  ChargePeriodEnd              VARCHAR2(4000),
+  ChargePeriodStart            VARCHAR2(4000),
+  ChargeSubcategory            VARCHAR2(4000),
+  CommitmentDiscountCategory   VARCHAR2(4000),
+  CommitmentDiscountId         VARCHAR2(4000),
+  CommitmentDiscountName       VARCHAR2(4000),
+  CommitmentDiscountType       VARCHAR2(4000),
+  EffectiveCost                NUMBER,
+  InvoiceIssuer                VARCHAR2(4000),
+  ListCost                     NUMBER,
+  ListUnitPrice                NUMBER,
+  PricingCategory              VARCHAR2(4000),
+  PricingQuantity              NUMBER,
+  PricingUnit                  VARCHAR2(4000),
+  Provider                     VARCHAR2(4000),
+  Publisher                    VARCHAR2(4000),
+  Region                       VARCHAR2(4000),
+  ResourceId                   VARCHAR2(4000),
+  ResourceName                 VARCHAR2(4000),
+  ResourceType                 VARCHAR2(4000),
+  ServiceCategory              VARCHAR2(4000),
+  ServiceName                  VARCHAR2(4000),
+  SkuId                        VARCHAR2(4000),
+  SkuPriceId                   VARCHAR2(4000),
+  SubAccountId                 VARCHAR2(4000),
+  SubAccountName               VARCHAR2(4000),
+  Tags                         VARCHAR2(4000),
+  UsageQuantity                NUMBER,
+  UsageUnit                    VARCHAR2(4000),
+  oci_ReferenceNumber          VARCHAR2(4000),
+  oci_CompartmentId            VARCHAR2(4000),
+  oci_CompartmentName          VARCHAR2(4000),
+  oci_OverageFlag              VARCHAR2(4000),
+  oci_UnitPriceOverage         VARCHAR2(4000),
+  oci_BilledQuantityOverage    VARCHAR2(4000),
+  oci_CostOverage              VARCHAR2(4000),
+  oci_AttributedUsage          NUMBER,
+  oci_AttributedCost           NUMBER,
+  oci_BackReferenceNumber      VARCHAR2(4000)
+);
+
+-- 3b. Log tables
+CREATE TABLE loaded_files_log (
+  filename   VARCHAR2(500) PRIMARY KEY,
+  load_date  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE load_failures_log (
+  filename       VARCHAR2(1000),
+  error_message  VARCHAR2(4000),
+  error_time     TIMESTAMP
+);
+
+-- 3c. Shared load procedure
+CREATE OR REPLACE PROCEDURE load_oci_cost_files (
+  p_days_back IN NUMBER
+) AS
+  l_uri    VARCHAR2(1000) := 'https://objectstorage.us-ashburn-1.oraclecloud.com/n/bling/b/ocid1.tenancy.oc1..xxxxxx/o/FOCUS%20Reports/';
+  l_errmsg VARCHAR2(4000);
+BEGIN
+  FOR r IN (
+    SELECT o.object_name
+    FROM   DBMS_CLOUD.LIST_OBJECTS('OCI$RESOURCE_PRINCIPAL', l_uri) o
+    WHERE  o.object_name LIKE '%.csv.gz'
+      AND  o.last_modified >= (SYSDATE - p_days_back)
+      AND  NOT EXISTS (SELECT 1 FROM loaded_files_log f WHERE f.filename = o.object_name)
+    ORDER  BY o.last_modified, o.object_name
+  ) LOOP
+    BEGIN
+      DBMS_CLOUD.COPY_DATA(
+        table_name      => 'OCI_COST_DATA_NEW',
+        credential_name => 'OCI$RESOURCE_PRINCIPAL',
+        file_uri_list   => l_uri || r.object_name,
+        format          => json_object(
+                             'type'                 VALUE 'csv',
+                             'delimiter'            VALUE ',',
+                             'compression'          VALUE 'gzip',
+                             'skipheaders'          VALUE '1',
+                             'quote'                VALUE '"',
+                             'timestampformat'      VALUE 'YYYY-MM-DD"T"HH24:MI:SS.FF3"Z"',
+                             'ignoremissingcolumns' VALUE 'true',
+                             'trimspaces'           VALUE 'lrtrim',
+                             'blankasnull'          VALUE 'true',
+                             'conversionerrors'     VALUE 'store_null',
+                             'rejectlimit'          VALUE '100000'
+                           )
+      );
+      INSERT INTO loaded_files_log (filename, load_date) VALUES (r.object_name, SYSTIMESTAMP);
+      COMMIT;
+    EXCEPTION WHEN OTHERS THEN
+      l_errmsg := SUBSTR(SQLERRM, 1, 4000);
+      INSERT INTO load_failures_log (filename, error_message, error_time)
+      VALUES (r.object_name, l_errmsg, SYSTIMESTAMP);
+      COMMIT;
+    END;
+  END LOOP;
+END;
+/
+SHOW ERRORS;
+
+-- 3d. Wrapper procedures
+CREATE OR REPLACE PROCEDURE load_oci_cost_backfill_90d    AS BEGIN load_oci_cost_files(90); END;
+/
+CREATE OR REPLACE PROCEDURE load_oci_cost_incremental_1d  AS BEGIN load_oci_cost_files(1);  END;
+/
+SHOW ERRORS;
+
+
+--------------------------------------------------------------------------------
+-- PHASE 4: 1-DAY TEST LOAD + VALIDATION
+--   Run this first. Validate data looks correct before triggering 90-day load.
+--------------------------------------------------------------------------------
+
+-- 4a. Load only last 1 day (small dataset)
+BEGIN
+  load_oci_cost_files(1);
+END;
+/
+
+-- 4b. Validate: file log
+SELECT COUNT(*) AS files_loaded_1day FROM loaded_files_log;
+SELECT COUNT(*) AS files_failed_1day FROM load_failures_log;
+
+-- Detail: which files loaded and which failed
+SELECT filename, load_date FROM loaded_files_log ORDER BY load_date DESC;
+SELECT filename, error_message, error_time FROM load_failures_log ORDER BY error_time DESC;
+
+-- 4c. Validate: cost data rows
+SELECT COUNT(*)                                                           AS total_rows,
+       MIN(TO_DATE(SUBSTR(ChargePeriodStart,1,10),'YYYY-MM-DD'))          AS earliest_charge,
+       MAX(TO_DATE(SUBSTR(ChargePeriodStart,1,10),'YYYY-MM-DD'))          AS latest_charge,
+       COUNT(DISTINCT ServiceName)                                         AS distinct_services,
+       COUNT(DISTINCT oci_CompartmentId)                                   AS distinct_compartments,
+       ROUND(SUM(EffectiveCost), 2)                                        AS total_effective_cost,
+       ROUND(SUM(BilledCost),    2)                                        AS total_billed_cost,
+       COUNT(CASE WHEN oci_CompartmentId IS NULL THEN 1 END)               AS null_compartment_id
+FROM   oci_cost_data_new;
+
+-- 4d. Validate: compartment join coverage (should be low or 0)
+SELECT COUNT(*) AS cost_rows_with_no_compartment_match
+FROM   oci_cost_data_new c
+WHERE  NOT EXISTS (
+         SELECT 1 FROM adb_oci_compartments cp
+         WHERE  cp.compartment_ocid = c.oci_CompartmentId
+       )
+  AND  c.oci_CompartmentId IS NOT NULL;
+
+-- 4e. Sample rows
+SELECT ServiceName, oci_CompartmentName, Region,
+       ChargePeriodStart, EffectiveCost, BilledCost
+FROM   oci_cost_data_new
+FETCH  FIRST 10 ROWS ONLY;
+
+-- *** REVIEW the above results before proceeding to Phase 5 ***
+
+
+--------------------------------------------------------------------------------
+-- PHASE 5: 90-DAY BACKFILL
+--   Only run after Phase 4 validation passes.
+--   The 1-day files already loaded will be skipped (loaded_files_log dedup).
+--------------------------------------------------------------------------------
+BEGIN
+  load_oci_cost_backfill_90d;
+END;
+/
+
+-- 5a. Validate backfill
+SELECT COUNT(*)                                                  AS total_rows,
+       MIN(TO_DATE(SUBSTR(ChargePeriodStart,1,10),'YYYY-MM-DD')) AS earliest_charge,
+       MAX(TO_DATE(SUBSTR(ChargePeriodStart,1,10),'YYYY-MM-DD')) AS latest_charge,
+       COUNT(DISTINCT ServiceName)                                AS distinct_services,
+       ROUND(SUM(EffectiveCost), 2)                               AS total_effective_cost
+FROM   oci_cost_data_new;
+
+SELECT COUNT(*) AS total_files_loaded FROM loaded_files_log;
+SELECT COUNT(*) AS total_files_failed FROM load_failures_log;
+
+-- 5b. Check for any remaining unloaded files
+SELECT COUNT(*) AS files_not_yet_loaded
+FROM   DBMS_CLOUD.LIST_OBJECTS(
+         'OCI$RESOURCE_PRINCIPAL',
+         'https://objectstorage.us-ashburn-1.oraclecloud.com/n/bling/b/ocid1.tenancy.oc1..xxxxxx/o/FOCUS%20Reports/'
+       ) o
+WHERE  o.object_name LIKE '%.csv.gz'
+  AND  NOT EXISTS (SELECT 1 FROM loaded_files_log f WHERE f.filename = o.object_name);
+
+
+--------------------------------------------------------------------------------
+-- PHASE 6: MATERIALIZED VIEW
+--   Only create after Phase 5 backfill + compartments are both populated.
+--------------------------------------------------------------------------------
+CREATE MATERIALIZED VIEW ADMIN.OCI_DAILY_COST_MV (
+  COST_DAY, COST_END_DAY, SERVICENAME, SERVICECATEGORY, REGION, AVAILABILITYZONE,
+  RESOURCEID, RESOURCENAME, RESOURCETYPE, OCI_COMPARTMENTID, OCI_COMPARTMENTNAME,
+  COMPARTMENTPATH, SUBACCOUNTID, SUBACCOUNTNAME, CHARGECATEGORY, CHARGESUBCATEGORY,
+  BILLINGCURRENCY, TAGS, DAILY_EFFECTIVECOST, DAILY_BILLEDCOST, DAILY_LISTCOST,
+  DAILY_USAGE, DAILY_ATTRIBUTEDCOST
+)
+DEFAULT COLLATION USING_NLS_COMP
+SEGMENT CREATION IMMEDIATE
+ORGANIZATION HEAP
+PCTFREE 10 PCTUSED 40 INITRANS 10 MAXTRANS 255
+COLUMN STORE COMPRESS FOR QUERY HIGH ROW LEVEL LOCKING
+LOGGING
+STORAGE (INITIAL 65536 NEXT 1048576 MINEXTENTS 1 MAXEXTENTS 2147483645
+         PCTINCREASE 0 FREELISTS 1 FREELIST GROUPS 1
+         BUFFER_POOL DEFAULT FLASH_CACHE DEFAULT CELL_FLASH_CACHE DEFAULT)
+TABLESPACE DATA
+BUILD IMMEDIATE
+USING INDEX
+REFRESH COMPLETE ON DEMAND
+USING DEFAULT LOCAL ROLLBACK SEGMENT
+USING ENFORCED CONSTRAINTS
+DISABLE ON QUERY COMPUTATION
+DISABLE QUERY REWRITE
+DISABLE CONCURRENT REFRESH
+AS
+SELECT
+  TRUNC(TO_DATE(SUBSTR(c.ChargePeriodStart, 1, 10), 'YYYY-MM-DD'))  AS COST_DAY,
+  TRUNC(TO_DATE(SUBSTR(c.ChargePeriodEnd,   1, 10), 'YYYY-MM-DD'))  AS COST_END_DAY,
+  c.ServiceName                                                       AS SERVICENAME,
+  c.ServiceCategory                                                   AS SERVICECATEGORY,
+  c.Region                                                            AS REGION,
+  c.AvailabilityZone                                                  AS AVAILABILITYZONE,
+  c.ResourceId                                                        AS RESOURCEID,
+  c.ResourceName                                                      AS RESOURCENAME,
+  c.ResourceType                                                      AS RESOURCETYPE,
+  c.oci_CompartmentId                                                 AS OCI_COMPARTMENTID,
+  c.oci_CompartmentName                                               AS OCI_COMPARTMENTNAME,
+  cp.HIERARCHY_PATH                                                   AS COMPARTMENTPATH,
+  c.SubAccountId                                                      AS SUBACCOUNTID,
+  c.SubAccountName                                                    AS SUBACCOUNTNAME,
+  c.ChargeCategory                                                    AS CHARGECATEGORY,
+  c.ChargeSubcategory                                                 AS CHARGESUBCATEGORY,
+  c.BillingCurrency                                                   AS BILLINGCURRENCY,
+  c.Tags                                                              AS TAGS,
+  SUM(NVL(c.EffectiveCost,      0))                                   AS DAILY_EFFECTIVECOST,
+  SUM(NVL(c.BilledCost,         0))                                   AS DAILY_BILLEDCOST,
+  SUM(NVL(c.ListCost,           0))                                   AS DAILY_LISTCOST,
+  SUM(NVL(c.UsageQuantity,      0))                                   AS DAILY_USAGE,
+  SUM(NVL(c.oci_AttributedCost, 0))                                   AS DAILY_ATTRIBUTEDCOST
+FROM ADMIN.OCI_COST_DATA_NEW c
+LEFT JOIN (
+  SELECT COMPARTMENT_OCID, MAX(HIERARCHY_PATH) AS HIERARCHY_PATH
+  FROM   ADMIN.ADB_OCI_COMPARTMENTS
+  GROUP  BY COMPARTMENT_OCID
+) cp ON cp.COMPARTMENT_OCID = c.oci_CompartmentId
+GROUP BY
+  TRUNC(TO_DATE(SUBSTR(c.ChargePeriodStart, 1, 10), 'YYYY-MM-DD')),
+  TRUNC(TO_DATE(SUBSTR(c.ChargePeriodEnd,   1, 10), 'YYYY-MM-DD')),
+  c.ServiceName, c.ServiceCategory, c.Region, c.AvailabilityZone,
+  c.ResourceId, c.ResourceName, c.ResourceType,
+  c.oci_CompartmentId, c.oci_CompartmentName, cp.HIERARCHY_PATH,
+  c.SubAccountId, c.SubAccountName, c.ChargeCategory, c.ChargeSubcategory,
+  c.BillingCurrency, c.Tags;
+
+-- 6a. Validate MV metadata
+SELECT mview_name, last_refresh_date, last_refresh_type, staleness, compile_state
+FROM   user_mviews
+WHERE  mview_name = 'OCI_DAILY_COST_MV';
+
+-- 6b. Validate MV content
+SELECT COUNT(*)                                                       AS mv_total_rows,
+       MIN(COST_DAY)                                                   AS earliest_day,
+       MAX(COST_DAY)                                                   AS latest_day,
+       ROUND(SUM(DAILY_EFFECTIVECOST), 2)                              AS total_effective_cost,
+       ROUND(SUM(DAILY_BILLEDCOST),    2)                              AS total_billed_cost,
+       COUNT(DISTINCT SERVICENAME)                                     AS distinct_services,
+       COUNT(DISTINCT REGION)                                          AS distinct_regions,
+       COUNT(DISTINCT OCI_COMPARTMENTNAME)                             AS distinct_compartments,
+       COUNT(CASE WHEN COMPARTMENTPATH IS NULL THEN 1 END)             AS missing_path
+FROM   ADMIN.OCI_DAILY_COST_MV;
+
+-- 6c. Top 10 services by cost
+SELECT SERVICENAME, ROUND(SUM(DAILY_EFFECTIVECOST), 2) AS total_cost
+FROM   ADMIN.OCI_DAILY_COST_MV
+GROUP  BY SERVICENAME
+ORDER  BY total_cost DESC
+FETCH  FIRST 10 ROWS ONLY;
+
+-- 6d. Cross-check MV cost vs raw table (numbers must match)
+SELECT 'RAW_TABLE' AS source, ROUND(SUM(EffectiveCost),       2) AS total_effective_cost FROM oci_cost_data_new
+UNION ALL
+SELECT 'MV'        AS source, ROUND(SUM(DAILY_EFFECTIVECOST), 2) AS total_effective_cost FROM ADMIN.OCI_DAILY_COST_MV;
+
+
+--------------------------------------------------------------------------------
+-- PHASE 7: SCHEDULE JOBS
+--   Only schedule after Phase 6 MV validation passes.
+--------------------------------------------------------------------------------
+
+-- 7a. Hourly incremental cost load job
+BEGIN
+  DBMS_SCHEDULER.CREATE_JOB (
+    job_name        => 'JOB_LOAD_OCI_COSTS_HOURLY',
+    job_type        => 'STORED_PROCEDURE',
+    job_action      => 'LOAD_OCI_COST_INCREMENTAL_1D',
+    start_date      => SYSTIMESTAMP,
+    repeat_interval => 'FREQ=HOURLY; INTERVAL=1',
+    enabled         => TRUE,
+    auto_drop       => FALSE,
+    comments        => 'Loads new OCI FOCUS cost report files from the last 1 day every hour'
+  );
+END;
+/
+
+-- 7b. 4-hour MV refresh job
+BEGIN
+  DBMS_SCHEDULER.CREATE_JOB (
+    job_name        => 'JOB_REFRESH_OCI_DAILY_COST_MV',
+    job_type        => 'PLSQL_BLOCK',
+    job_action      => 'BEGIN DBMS_MVIEW.REFRESH(''ADMIN.OCI_DAILY_COST_MV'', ''C''); END;',
+    start_date      => SYSTIMESTAMP,
+    repeat_interval => 'FREQ=HOURLY; INTERVAL=4',
+    enabled         => TRUE,
+    auto_drop       => FALSE,
+    comments        => 'Complete refresh of OCI_DAILY_COST_MV every 4 hours'
+  );
+END;
+/
+
+-- 7c. Hourly compartments refresh job
+BEGIN
+  DBMS_SCHEDULER.CREATE_JOB (
     job_name        => 'JOB_REFRESH_OCI_COMPARTMENTS',
     job_type        => 'STORED_PROCEDURE',
     job_action      => 'REFRESH_OCI_COMPARTMENTS',
-    start_date      => systimestamp,
-    repeat_interval => 'FREQ=HOURLY;INTERVAL=1',
-    enabled         => true,
+    start_date      => SYSTIMESTAMP,
+    repeat_interval => 'FREQ=HOURLY; INTERVAL=1',
+    enabled         => TRUE,
+    auto_drop       => FALSE,
     comments        => 'Refresh OCI compartments every 1 hour'
   );
-end;
+END;
 /
+
+
 --------------------------------------------------------------------------------
--- 7. OPTIONAL: VERIFY JOB
+-- PHASE 8: FINAL SANITY CHECK
 --------------------------------------------------------------------------------
-select job_name, enabled, state, repeat_interval
-from user_scheduler_jobs
-where job_name = 'JOB_REFRESH_OCI_COMPARTMENTS';
-/
---------------------------------------------------------------------------------
--- 8. OPTIONAL: VIEW LATEST RUNS
---------------------------------------------------------------------------------
-select *
-from adb_oci_compartments_log
-order by run_id desc;
-/
---------------------------------------------------------------------------------
--- 9. OPTIONAL: VIEW COMPARTMENTS
---------------------------------------------------------------------------------
-select
-  compartment_ocid,
-  parent_compartment_ocid,
-  name,
-  lifecycle_state,
-  hierarchy_level,
-  hierarchy_path,
-  last_refresh_ts
-from adb_oci_compartments
-order by hierarchy_path nulls first, name;
-/
+SELECT job_name, enabled, state, last_start_date, last_run_duration, repeat_interval
+FROM   user_scheduler_jobs
+WHERE  job_name IN ('JOB_LOAD_OCI_COSTS_HOURLY','JOB_REFRESH_OCI_DAILY_COST_MV','JOB_REFRESH_OCI_COMPARTMENTS')
+ORDER  BY job_name;
+
+SELECT 'JOBS'            AS object_type, COUNT(*) AS cnt FROM user_scheduler_jobs WHERE job_name   IN ('JOB_LOAD_OCI_COSTS_HOURLY','JOB_REFRESH_OCI_DAILY_COST_MV','JOB_REFRESH_OCI_COMPARTMENTS')
+UNION ALL
+SELECT 'MV'              AS object_type, COUNT(*) AS cnt FROM user_mviews          WHERE mview_name = 'OCI_DAILY_COST_MV'
+UNION ALL
+SELECT 'COST_TABLE_ROWS' AS object_type, COUNT(*) AS cnt FROM oci_cost_data_new
+UNION ALL
+SELECT 'MV_ROWS'         AS object_type, COUNT(*) AS cnt FROM ADMIN.OCI_DAILY_COST_MV
+UNION ALL
+SELECT 'COMPARTMENTS'    AS object_type, COUNT(*) AS cnt FROM adb_oci_compartments
+UNION ALL
+SELECT 'FAILED_FILES'    AS object_type, COUNT(*) AS cnt FROM load_failures_log;
