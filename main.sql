@@ -2,7 +2,8 @@
 -- OCI FinOps Cost Report Loader
 -- Design:
 --   1) Run 90-day backfill once
---   2) Run 1-day incremental on schedule
+--   2) Create/refresh materialized view
+--   3) Run 1-day incremental on schedule
 --------------------------------------------------------------------------------
 
 --------------------------------------------------------------------------------
@@ -167,10 +168,116 @@ BEGIN
   load_oci_cost_backfill_90d;
 END;
 /
--- After first successful backfill, you can comment out or remove the block above.
+-- After first successful backfill, comment out or remove the block above.
 
 --------------------------------------------------------------------------------
--- 8. DROP OLD JOB IF IT EXISTS
+-- 8. CREATE DAILY COST MATERIALIZED VIEW
+--    Built immediately after the 90-day backfill so the MV is fully populated
+--    from the start.  Subsequent refreshes are triggered manually or via the
+--    scheduler job added in section 11.
+--
+--    Prerequisites:
+--      • OCI_COST_DATA_NEW  -- populated by step 7
+--      • ADMIN.ADB_OCI_COMPARTMENTS -- compartment hierarchy table
+--------------------------------------------------------------------------------
+CREATE MATERIALIZED VIEW "ADMIN"."OCI_DAILY_COST_MV" (
+  "COST_DAY",
+  "COST_END_DAY",
+  "SERVICENAME",
+  "SERVICECATEGORY",
+  "REGION",
+  "AVAILABILITYZONE",
+  "RESOURCEID",
+  "RESOURCENAME",
+  "RESOURCETYPE",
+  "OCI_COMPARTMENTID",
+  "OCI_COMPARTMENTNAME",
+  "COMPARTMENTPATH",
+  "SUBACCOUNTID",
+  "SUBACCOUNTNAME",
+  "CHARGECATEGORY",
+  "CHARGESUBCATEGORY",
+  "BILLINGCURRENCY",
+  "TAGS",
+  "DAILY_EFFECTIVECOST",
+  "DAILY_BILLEDCOST",
+  "DAILY_LISTCOST",
+  "DAILY_USAGE",
+  "DAILY_ATTRIBUTEDCOST"
+)
+DEFAULT COLLATION "USING_NLS_COMP"
+SEGMENT CREATION IMMEDIATE
+ORGANIZATION HEAP PCTFREE 10 PCTUSED 40 INITRANS 10 MAXTRANS 255
+COLUMN STORE COMPRESS FOR QUERY HIGH ROW LEVEL LOCKING LOGGING
+STORAGE (
+  INITIAL 65536 NEXT 1048576 MINEXTENTS 1 MAXEXTENTS 2147483645
+  PCTINCREASE 0 FREELISTS 1 FREELIST GROUPS 1
+  BUFFER_POOL DEFAULT FLASH_CACHE DEFAULT CELL_FLASH_CACHE DEFAULT
+)
+TABLESPACE "DATA"
+BUILD IMMEDIATE                          -- populate right away from backfill data
+USING INDEX
+REFRESH COMPLETE ON DEMAND               -- full refresh; switched to incremental later if a MV log is added
+USING DEFAULT LOCAL ROLLBACK SEGMENT
+USING ENFORCED CONSTRAINTS
+DISABLE ON QUERY COMPUTATION
+DISABLE QUERY REWRITE
+DISABLE CONCURRENT REFRESH
+AS
+SELECT
+    TRUNC(TO_DATE(SUBSTR(c.ChargePeriodStart, 1, 10), 'YYYY-MM-DD')) AS COST_DAY,
+    TRUNC(TO_DATE(SUBSTR(c.ChargePeriodEnd,   1, 10), 'YYYY-MM-DD')) AS COST_END_DAY,
+    c.ServiceName                                                     AS SERVICENAME,
+    c.ServiceCategory                                                 AS SERVICECATEGORY,
+    c.Region                                                          AS REGION,
+    c.AvailabilityZone                                                AS AVAILABILITYZONE,
+    c.ResourceId                                                      AS RESOURCEID,
+    c.ResourceName                                                    AS RESOURCENAME,
+    c.ResourceType                                                    AS RESOURCETYPE,
+    c.OCI_CompartmentId                                               AS OCI_COMPARTMENTID,
+    c.OCI_CompartmentName                                             AS OCI_COMPARTMENTNAME,
+    cp.HIERARCHY_PATH                                                 AS COMPARTMENTPATH,
+    c.SubAccountId                                                    AS SUBACCOUNTID,
+    c.SubAccountName                                                  AS SUBACCOUNTNAME,
+    c.ChargeCategory                                                  AS CHARGECATEGORY,
+    c.ChargeSubCategory                                               AS CHARGESUBCATEGORY,
+    c.BillingCurrency                                                 AS BILLINGCURRENCY,
+    c.Tags                                                            AS TAGS,
+    SUM(NVL(c.EffectiveCost,       0))                                AS DAILY_EFFECTIVECOST,
+    SUM(NVL(c.BilledCost,          0))                                AS DAILY_BILLEDCOST,
+    SUM(NVL(c.ListCost,            0))                                AS DAILY_LISTCOST,
+    SUM(NVL(c.UsageQuantity,       0))                                AS DAILY_USAGE,
+    SUM(NVL(c.OCI_AttributedCost,  0))                                AS DAILY_ATTRIBUTEDCOST
+FROM ADMIN.OCI_COST_DATA_NEW c
+LEFT JOIN (
+    SELECT
+        COMPARTMENT_OCID,
+        MAX(HIERARCHY_PATH) AS HIERARCHY_PATH
+    FROM ADMIN.ADB_OCI_COMPARTMENTS
+    GROUP BY COMPARTMENT_OCID
+) cp ON cp.COMPARTMENT_OCID = c.OCI_COMPARTMENTID
+GROUP BY
+    TRUNC(TO_DATE(SUBSTR(c.ChargePeriodStart, 1, 10), 'YYYY-MM-DD')),
+    TRUNC(TO_DATE(SUBSTR(c.ChargePeriodEnd,   1, 10), 'YYYY-MM-DD')),
+    c.ServiceName,
+    c.ServiceCategory,
+    c.Region,
+    c.AvailabilityZone,
+    c.ResourceId,
+    c.ResourceName,
+    c.ResourceType,
+    c.OCI_CompartmentId,
+    c.OCI_CompartmentName,
+    cp.HIERARCHY_PATH,
+    c.SubAccountId,
+    c.SubAccountName,
+    c.ChargeCategory,
+    c.ChargeSubCategory,
+    c.BillingCurrency,
+    c.Tags;
+
+--------------------------------------------------------------------------------
+-- 9. DROP OLD JOB IF IT EXISTS
 --------------------------------------------------------------------------------
 BEGIN
   DBMS_SCHEDULER.DROP_JOB('JOB_LOAD_OCI_COSTS_HOURLY', TRUE);
@@ -181,7 +288,18 @@ END;
 /
 
 --------------------------------------------------------------------------------
--- 9. CREATE HOURLY INCREMENTAL JOB
+-- 10. DROP OLD MV REFRESH JOB IF IT EXISTS
+--------------------------------------------------------------------------------
+BEGIN
+  DBMS_SCHEDULER.DROP_JOB('JOB_REFRESH_OCI_DAILY_COST_MV', TRUE);
+EXCEPTION
+  WHEN OTHERS THEN
+    NULL;
+END;
+/
+
+--------------------------------------------------------------------------------
+-- 11. CREATE HOURLY INCREMENTAL DATA LOAD JOB
 --------------------------------------------------------------------------------
 BEGIN
   DBMS_SCHEDULER.CREATE_JOB (
@@ -198,28 +316,51 @@ END;
 /
 
 --------------------------------------------------------------------------------
--- 10. VALIDATION QUERIES
+-- 12. CREATE DAILY MV REFRESH JOB
+--     Runs once per day, offset by 30 min after midnight to let any late
+--     arriving hourly loads complete before the MV is rebuilt.
+--     Adjust BYHOUR/BYMINUTE to match your preferred refresh window.
 --------------------------------------------------------------------------------
-SELECT COUNT(*) AS target_rows
-FROM oci_cost_data_new;
+BEGIN
+  DBMS_SCHEDULER.CREATE_JOB (
+    job_name        => 'JOB_REFRESH_OCI_DAILY_COST_MV',
+    job_type        => 'PLSQL_BLOCK',
+    job_action      => 'BEGIN DBMS_MVIEW.REFRESH(''OCI_DAILY_COST_MV'', method => ''C'', atomic_refresh => FALSE); END;',
+    start_date      => SYSTIMESTAMP,
+    repeat_interval => 'FREQ=DAILY; BYHOUR=0; BYMINUTE=30; BYSECOND=0',
+    enabled         => TRUE,
+    auto_drop       => FALSE,
+    comments        => 'Full refresh of OCI_DAILY_COST_MV once per day at 00:30 UTC'
+  );
+END;
+/
 
-SELECT COUNT(*) AS logged_files
-FROM loaded_files_log;
+--------------------------------------------------------------------------------
+-- 13. VALIDATION QUERIES
+--------------------------------------------------------------------------------
+SELECT COUNT(*) AS target_rows     FROM oci_cost_data_new;
+SELECT COUNT(*) AS logged_files    FROM loaded_files_log;
+SELECT COUNT(*) AS failed_files    FROM load_failures_log;
+SELECT COUNT(*) AS mv_rows         FROM oci_daily_cost_mv;
 
-SELECT COUNT(*) AS failed_files
-FROM load_failures_log;
-
+-- Scheduler job status
 SELECT job_name, state, last_start_date, last_run_duration
 FROM user_scheduler_jobs
-WHERE job_name = 'JOB_LOAD_OCI_COSTS_HOURLY';
+WHERE job_name IN ('JOB_LOAD_OCI_COSTS_HOURLY', 'JOB_REFRESH_OCI_DAILY_COST_MV');
 
-SELECT log_date, status, error#, run_duration, additional_info
+-- Recent job run history
+SELECT job_name, log_date, status, error#, run_duration, additional_info
 FROM user_scheduler_job_run_details
-WHERE job_name = 'JOB_LOAD_OCI_COSTS_HOURLY'
+WHERE job_name IN ('JOB_LOAD_OCI_COSTS_HOURLY', 'JOB_REFRESH_OCI_DAILY_COST_MV')
 ORDER BY log_date DESC;
 
+-- MV metadata
+SELECT mview_name, last_refresh_date, last_refresh_type, staleness
+FROM user_mviews
+WHERE mview_name = 'OCI_DAILY_COST_MV';
+
 --------------------------------------------------------------------------------
--- 11. OPTIONAL: SEE WHAT FILES ARE STILL NOT LOGGED
+-- 14. OPTIONAL: FILES NOT YET LOGGED
 --------------------------------------------------------------------------------
 SELECT COUNT(*) AS files_not_logged
 FROM DBMS_CLOUD.LIST_OBJECTS(
