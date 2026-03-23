@@ -46,7 +46,7 @@ CREATE TABLE oci_cost_data_new (
   SkuPriceId                   VARCHAR2(4000),
   SubAccountId                 VARCHAR2(4000),
   SubAccountName               VARCHAR2(4000),
-  Tags                         VARCHAR2(4000),
+  Tags                         VARCHAR2(32767),
   UsageQuantity                NUMBER,
   UsageUnit                    VARCHAR2(4000),
   oci_ReferenceNumber          VARCHAR2(4000),
