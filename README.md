@@ -96,7 +96,7 @@ If no row is returned, enable it:
 ```sql
 EXEC DBMS_CLOUD_ADMIN.ENABLE_RESOURCE_PRINCIPAL();
 ```
-
+### Execute the code in get_compartments.sql
 ---
 
 ## Database Objects
