@@ -180,44 +180,46 @@ END;
 --      • OCI_COST_DATA_NEW  -- populated by step 7
 --      • ADMIN.ADB_OCI_COMPARTMENTS -- compartment hierarchy table
 --------------------------------------------------------------------------------
-CREATE MATERIALIZED VIEW "ADMIN"."OCI_DAILY_COST_MV" (
-  "COST_DAY",
-  "COST_END_DAY",
-  "SERVICENAME",
-  "SERVICECATEGORY",
-  "REGION",
-  "AVAILABILITYZONE",
-  "RESOURCEID",
-  "RESOURCENAME",
-  "RESOURCETYPE",
-  "OCI_COMPARTMENTID",
-  "OCI_COMPARTMENTNAME",
-  "COMPARTMENTPATH",
-  "SUBACCOUNTID",
-  "SUBACCOUNTNAME",
-  "CHARGECATEGORY",
-  "CHARGESUBCATEGORY",
-  "BILLINGCURRENCY",
-  "TAGS",
-  "DAILY_EFFECTIVECOST",
-  "DAILY_BILLEDCOST",
-  "DAILY_LISTCOST",
-  "DAILY_USAGE",
-  "DAILY_ATTRIBUTEDCOST"
+CREATE MATERIALIZED VIEW ADMIN.OCI_DAILY_COST_MV
+(
+  COST_DAY,
+  COST_END_DAY,
+  SERVICENAME,
+  SERVICECATEGORY,
+  REGION,
+  AVAILABILITYZONE,
+  RESOURCEID,
+  RESOURCENAME,
+  RESOURCETYPE,
+  OCI_COMPARTMENTID,
+  OCI_COMPARTMENTNAME,
+  COMPARTMENTPATH,
+  SUBACCOUNTID,
+  SUBACCOUNTNAME,
+  CHARGECATEGORY,
+  CHARGESUBCATEGORY,
+  BILLINGCURRENCY,
+  TAGS,
+  DAILY_EFFECTIVECOST,
+  DAILY_BILLEDCOST,
+  DAILY_LISTCOST,
+  DAILY_USAGE,
+  DAILY_ATTRIBUTEDCOST
 )
-DEFAULT COLLATION "USING_NLS_COMP"
+DEFAULT COLLATION USING_NLS_COMP
 SEGMENT CREATION IMMEDIATE
-ORGANIZATION HEAP PCTFREE 10 PCTUSED 40 INITRANS 10 MAXTRANS 255
-COLUMN STORE COMPRESS FOR QUERY HIGH ROW LEVEL LOCKING LOGGING
-STORAGE (
-  INITIAL 65536 NEXT 1048576 MINEXTENTS 1 MAXEXTENTS 2147483645
-  PCTINCREASE 0 FREELISTS 1 FREELIST GROUPS 1
-  BUFFER_POOL DEFAULT FLASH_CACHE DEFAULT CELL_FLASH_CACHE DEFAULT
-)
-TABLESPACE "DATA"
-BUILD IMMEDIATE                          -- populate right away from backfill data
+ORGANIZATION HEAP
+PCTFREE 10
+PCTUSED 40
+INITRANS 10
+MAXTRANS 255
+COLUMN STORE COMPRESS FOR QUERY HIGH
+ROW LEVEL LOCKING
+LOGGING
+TABLESPACE DATA
+BUILD IMMEDIATE
 USING INDEX
-REFRESH COMPLETE ON DEMAND               -- full refresh; switched to incremental later if a MV log is added
+REFRESH COMPLETE ON DEMAND
 USING DEFAULT LOCAL ROLLBACK SEGMENT
 USING ENFORCED CONSTRAINTS
 DISABLE ON QUERY COMPUTATION
@@ -225,56 +227,55 @@ DISABLE QUERY REWRITE
 DISABLE CONCURRENT REFRESH
 AS
 SELECT
-    TRUNC(TO_DATE(SUBSTR(c.ChargePeriodStart, 1, 10), 'YYYY-MM-DD')) AS COST_DAY,
-    TRUNC(TO_DATE(SUBSTR(c.ChargePeriodEnd,   1, 10), 'YYYY-MM-DD')) AS COST_END_DAY,
-    c.ServiceName                                                     AS SERVICENAME,
-    c.ServiceCategory                                                 AS SERVICECATEGORY,
-    c.Region                                                          AS REGION,
-    c.AvailabilityZone                                                AS AVAILABILITYZONE,
-    c.ResourceId                                                      AS RESOURCEID,
-    c.ResourceName                                                    AS RESOURCENAME,
-    c.ResourceType                                                    AS RESOURCETYPE,
-    c.OCI_CompartmentId                                               AS OCI_COMPARTMENTID,
-    c.OCI_CompartmentName                                             AS OCI_COMPARTMENTNAME,
-    cp.HIERARCHY_PATH                                                 AS COMPARTMENTPATH,
-    c.SubAccountId                                                    AS SUBACCOUNTID,
-    c.SubAccountName                                                  AS SUBACCOUNTNAME,
-    c.ChargeCategory                                                  AS CHARGECATEGORY,
-    c.ChargeSubCategory                                               AS CHARGESUBCATEGORY,
-    c.BillingCurrency                                                 AS BILLINGCURRENCY,
-    c.Tags                                                            AS TAGS,
-    SUM(NVL(c.EffectiveCost,       0))                                AS DAILY_EFFECTIVECOST,
-    SUM(NVL(c.BilledCost,          0))                                AS DAILY_BILLEDCOST,
-    SUM(NVL(c.ListCost,            0))                                AS DAILY_LISTCOST,
-    SUM(NVL(c.UsageQuantity,       0))                                AS DAILY_USAGE,
-    SUM(NVL(c.OCI_AttributedCost,  0))                                AS DAILY_ATTRIBUTEDCOST
+  TRUNC(TO_DATE(SUBSTR(c.ChargePeriodStart, 1, 10), 'YYYY-MM-DD')) AS COST_DAY,
+  TRUNC(TO_DATE(SUBSTR(c.ChargePeriodEnd,   1, 10), 'YYYY-MM-DD')) AS COST_END_DAY,
+  c.ServiceName                                                     AS SERVICENAME,
+  c.ServiceCategory                                                 AS SERVICECATEGORY,
+  c.Region                                                          AS REGION,
+  c.AvailabilityZone                                                AS AVAILABILITYZONE,
+  c.ResourceId                                                      AS RESOURCEID,
+  c.ResourceName                                                    AS RESOURCENAME,
+  c.ResourceType                                                    AS RESOURCETYPE,
+  c.oci_CompartmentId                                               AS OCI_COMPARTMENTID,
+  c.oci_CompartmentName                                             AS OCI_COMPARTMENTNAME,
+  cp.HIERARCHY_PATH                                                 AS COMPARTMENTPATH,
+  c.SubAccountId                                                    AS SUBACCOUNTID,
+  c.SubAccountName                                                  AS SUBACCOUNTNAME,
+  c.ChargeCategory                                                  AS CHARGECATEGORY,
+  c.ChargeSubcategory                                               AS CHARGESUBCATEGORY,
+  c.BillingCurrency                                                 AS BILLINGCURRENCY,
+  CAST(c.Tags AS VARCHAR2(4000))                                    AS TAGS,
+  SUM(NVL(c.EffectiveCost,      0))                                 AS DAILY_EFFECTIVECOST,
+  SUM(NVL(c.BilledCost,         0))                                 AS DAILY_BILLEDCOST,
+  SUM(NVL(c.ListCost,           0))                                 AS DAILY_LISTCOST,
+  SUM(NVL(c.UsageQuantity,      0))                                 AS DAILY_USAGE,
+  SUM(NVL(c.oci_AttributedCost, 0))                                 AS DAILY_ATTRIBUTEDCOST
 FROM ADMIN.OCI_COST_DATA_NEW c
 LEFT JOIN (
-    SELECT
-        COMPARTMENT_OCID,
-        MAX(HIERARCHY_PATH) AS HIERARCHY_PATH
-    FROM ADMIN.ADB_OCI_COMPARTMENTS
-    GROUP BY COMPARTMENT_OCID
-) cp ON cp.COMPARTMENT_OCID = c.OCI_COMPARTMENTID
+  SELECT COMPARTMENT_OCID, MAX(HIERARCHY_PATH) AS HIERARCHY_PATH
+  FROM ADMIN.ADB_OCI_COMPARTMENTS
+  GROUP BY COMPARTMENT_OCID
+) cp
+  ON cp.COMPARTMENT_OCID = c.oci_CompartmentId
 GROUP BY
-    TRUNC(TO_DATE(SUBSTR(c.ChargePeriodStart, 1, 10), 'YYYY-MM-DD')),
-    TRUNC(TO_DATE(SUBSTR(c.ChargePeriodEnd,   1, 10), 'YYYY-MM-DD')),
-    c.ServiceName,
-    c.ServiceCategory,
-    c.Region,
-    c.AvailabilityZone,
-    c.ResourceId,
-    c.ResourceName,
-    c.ResourceType,
-    c.OCI_CompartmentId,
-    c.OCI_CompartmentName,
-    cp.HIERARCHY_PATH,
-    c.SubAccountId,
-    c.SubAccountName,
-    c.ChargeCategory,
-    c.ChargeSubCategory,
-    c.BillingCurrency,
-    c.Tags;
+  TRUNC(TO_DATE(SUBSTR(c.ChargePeriodStart, 1, 10), 'YYYY-MM-DD')),
+  TRUNC(TO_DATE(SUBSTR(c.ChargePeriodEnd,   1, 10), 'YYYY-MM-DD')),
+  c.ServiceName,
+  c.ServiceCategory,
+  c.Region,
+  c.AvailabilityZone,
+  c.ResourceId,
+  c.ResourceName,
+  c.ResourceType,
+  c.oci_CompartmentId,
+  c.oci_CompartmentName,
+  cp.HIERARCHY_PATH,
+  c.SubAccountId,
+  c.SubAccountName,
+  c.ChargeCategory,
+  c.ChargeSubcategory,
+  c.BillingCurrency,
+  CAST(c.Tags AS VARCHAR2(4000));
 
 --------------------------------------------------------------------------------
 -- 9. DROP OLD JOB IF IT EXISTS
